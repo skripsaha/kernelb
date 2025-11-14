@@ -859,66 +859,92 @@ void vmm_init(void) {
     spinlock_init(&kernel_heap_lock);
     spinlock_init(&vmalloc_lock);
 
-    // Create kernel context
-    kernel_context = vmm_create_context();
+    // ========================================================================
+    // FIXED: Reuse bootloader's PML4 instead of creating a new one
+    // ========================================================================
+    // The bootloader already set up:
+    //   - Identity mapping: 0-512MB (PML4[0] -> PDPT0 -> PD0)
+    //   - Direct mapping: 0xFFFF880000000000-0xFFFF88001FFFFFFF -> 0-512MB phys (PML4[272] -> PDPT1 -> PD1)
+    //   - CR3 = 0x500000
+    // We'll adopt this PML4 and extend it as needed.
+    // ========================================================================
+
+    // Get current CR3 (bootloader's PML4 physical address)
+    uintptr_t current_cr3;
+    asm volatile("mov %%cr3, %0" : "=r"(current_cr3));
+
+    kprintf("[VMM] Adopting bootloader's PML4 at physical 0x%p\n", (void*)current_cr3);
+
+    // Create kernel context structure (but use existing PML4)
+    kernel_context = kmalloc(sizeof(vmm_context_t));
     if (!kernel_context) {
-        panic("Failed to create kernel VMM context");
+        panic("Failed to allocate kernel VMM context");
     }
+
+    memset(kernel_context, 0, sizeof(vmm_context_t));
+
+    // Use bootloader's PML4 (already mapped via direct mapping)
+    kernel_context->pml4_phys = current_cr3;
+    kernel_context->pml4 = (page_table_t*)vmm_phys_to_virt(current_cr3);
+    kernel_context->heap_start = VMM_USER_HEAP_BASE;
+    kernel_context->heap_end = VMM_USER_HEAP_BASE;
+    kernel_context->stack_top = VMM_USER_STACK_TOP;
+
+    spinlock_init(&kernel_context->lock);
 
     kprintf("[VMM] Kernel context created at %p\n", kernel_context);
-    kprintf("[VMM] PML4 physical address: 0x%p\n", (void*)kernel_context->pml4_phys);
+    kprintf("[VMM] PML4 physical: 0x%p, virtual: %p\n",
+           (void*)kernel_context->pml4_phys, kernel_context->pml4);
 
-    // Set up identity mapping for first 256MB
-    // CRITICAL: VMM relies on physical = virtual for page table access!
-    // PMM can allocate memory anywhere in physical RAM, so we need enough
-    // identity mapping to cover all possible allocations.
-    // 256MB should be sufficient for QEMU with 512MB RAM
-    kprintf("[VMM] Setting up identity mapping for first 256MB (CRITICAL for VMM)...\n");
-    size_t identity_pages = 0;
-    for (uintptr_t addr = 0; addr < 0x10000000; addr += VMM_PAGE_SIZE) { // 256MB
-        vmm_map_result_t result = vmm_map_page(kernel_context, addr, addr, VMM_FLAGS_KERNEL_RW);
-        if (result.success) {
-            identity_pages++;
-        } else if (addr < 0x1000000) { // First 16MB is critical
-            kprintf("[VMM] CRITICAL: Failed to identity map 0x%p: %s\n",
-                   (void*)addr, result.error_msg);
-        }
-    }
-    kprintf("[VMM] Identity mapped %zu pages (0x%p bytes)\n",
-           identity_pages, (void*)(identity_pages * VMM_PAGE_SIZE));
-
-    kprintf("[VMM] Kernel heap will be mapped on demand starting at 0x%p\n",
-           (void*)VMM_KERNEL_HEAP_BASE);
-
-    // Test identity mapping by writing & reading known physical address (1MB mark)
-    kprintf("[VMM] Testing identity mapping...\n");
-    volatile uint32_t* test_ptr = (volatile uint32_t*)0x100000; // 1MB
-    uint32_t old_value = *test_ptr;
-    *test_ptr = 0xDEADBEEF;
-    if (*test_ptr != 0xDEADBEEF) {
-        panic("Identity mapping test failed");
-    }
-    *test_ptr = old_value; // Restore
-    kprintf("[VMM] Identity mapping test: PASSED\n");
-
-    // Switch to our new page tables
     current_context = kernel_context;
-    vmm_switch_context(kernel_context);
 
-    // Test that we can still access memory after switch
-    *test_ptr = 0xCAFEBABE;
-    if (*test_ptr != 0xCAFEBABE) {
-        panic("Page table switch broke memory access");
+    // No need to switch CR3 - we're already using the right page tables!
+    kprintf("[VMM] Already using bootloader's page tables (CR3=0x%p)\n", (void*)current_cr3);
+
+    // Test direct mapping by accessing page tables through higher-half
+    kprintf("[VMM] Testing direct mapping access to page tables...\n");
+    page_table_t* pml4_via_direct_map = (page_table_t*)vmm_phys_to_virt(current_cr3);
+    pte_t pml4_entry_0 = pml4_via_direct_map->entries[0];
+    pte_t pml4_entry_272 = pml4_via_direct_map->entries[272];
+
+    if (!(pml4_entry_0 & VMM_FLAG_PRESENT) || !(pml4_entry_272 & VMM_FLAG_PRESENT)) {
+        panic("Direct mapping test failed: cannot access PML4 entries");
     }
-    *test_ptr = old_value; // Restore
+
+    kprintf("[VMM] Direct mapping test PASSED\n");
+    kprintf("[VMM]   PML4[0] (identity):     0x%llx (present: %s)\n",
+           (unsigned long long)pml4_entry_0,
+           (pml4_entry_0 & VMM_FLAG_PRESENT) ? "yes" : "no");
+    kprintf("[VMM]   PML4[272] (direct map): 0x%llx (present: %s)\n",
+           (unsigned long long)pml4_entry_272,
+           (pml4_entry_272 & VMM_FLAG_PRESENT) ? "yes" : "no");
+
+    // Test memory access through direct mapping
+    kprintf("[VMM] Testing memory access through direct mapping...\n");
+    volatile uint32_t* test_ptr_direct = (volatile uint32_t*)vmm_phys_to_virt(0x100000); // 1MB phys
+    uint32_t old_value = *test_ptr_direct;
+    *test_ptr_direct = 0xDEADBEEF;
+    if (*test_ptr_direct != 0xDEADBEEF) {
+        panic("Direct mapping memory access test failed");
+    }
+    *test_ptr_direct = old_value;
+    kprintf("[VMM] Direct mapping memory access test PASSED\n");
+
+    spin_lock(&vmm_global_lock);
+    global_stats.total_contexts++;
+    spin_unlock(&vmm_global_lock);
 
     vmm_initialized = true;
 
     kprintf("[VMM] Virtual memory layout:\n");
-    kprintf("[VMM]   Kernel base:      0x%p\n", (void*)VMM_KERNEL_BASE);
+    kprintf("[VMM]   Identity map:     0x0000000000000000 - 0x000000001FFFFFFF (0-512MB)\n");
+    kprintf("[VMM]   User space:       0x0000000000000000 - 0x00007FFFFFFFFFFF (lower half)\n");
     kprintf("[VMM]   Kernel heap:      0x%p - 0x%p (on-demand)\n",
            (void*)VMM_KERNEL_HEAP_BASE,
            (void*)(VMM_KERNEL_HEAP_BASE + VMM_KERNEL_HEAP_SIZE));
+    kprintf("[VMM]   Direct phys map:  0x%p - 0x%p (0-512MB phys)\n",
+           (void*)VMM_DIRECT_MAP_BASE,
+           (void*)(VMM_DIRECT_MAP_BASE + 0x20000000));
     kprintf("[VMM]   User base:        0x%p\n", (void*)VMM_USER_BASE);
     kprintf("[VMM]   User heap:        0x%p\n", (void*)VMM_USER_HEAP_BASE);
     kprintf("[VMM]   User stack top:   0x%p\n", (void*)VMM_USER_STACK_TOP);

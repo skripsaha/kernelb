@@ -9,9 +9,17 @@
 #define VMM_PAGE_OFFSET_MASK    0x0000000000000FFFULL
 
 // Virtual address space layout
+// Standard x86-64 kernel memory map:
+// 0x0000000000000000 - 0x00007FFFFFFFFFFF: User space (lower half, 128TB)
+// 0xFFFF800000000000 - 0xFFFF87FFFFFFFFFF: Kernel heap (128TB)
+// 0xFFFF880000000000 - 0xFFFFC7FFFFFFFFFF: Direct physical mapping (64TB)
+// 0xFFFFFFFF80000000 - 0xFFFFFFFFFFFFFFFF: Kernel code/data (2GB)
+
 #define VMM_KERNEL_BASE         0xFFFF800000000000ULL  // -128TB
 #define VMM_KERNEL_HEAP_BASE    0xFFFF800000000000ULL  // Kernel heap start
 #define VMM_KERNEL_HEAP_SIZE    (1ULL << 30)           // 1GB kernel heap
+#define VMM_DIRECT_MAP_BASE     0xFFFF880000000000ULL  // Direct physical mapping base
+#define VMM_DIRECT_MAP_SIZE     (64ULL << 40)          // 64TB direct mapping
 #define VMM_USER_BASE           0x0000000000400000ULL  // 4MB (standard ELF base)
 #define VMM_USER_STACK_TOP      0x00007FFFFFFFE000ULL  // ~128TB user space top
 #define VMM_USER_HEAP_BASE      0x0000000001000000ULL  // 16MB user heap start
@@ -205,32 +213,33 @@ static inline pte_t vmm_make_pte(uintptr_t phys_addr, uint64_t flags) {
 }
 
 // ========== PHYSICAL ↔ VIRTUAL ADDRESS TRANSLATION ==========
-// CRITICAL: VMM/PMM architecture currently relies on identity mapping!
-// These functions convert between physical and virtual addresses.
-//
-// Current implementation: Uses identity mapping (physical = virtual for low memory)
-// Future improvement: Should use higher-half direct mapping (0xFFFF880000000000+)
+// FIXED: Proper direct mapping implementation using higher-half addresses
+// All physical memory is mapped at VMM_DIRECT_MAP_BASE (0xFFFF880000000000)
+// This allows the kernel to access any physical address without identity mapping
 
 static inline void* vmm_phys_to_virt(uintptr_t phys_addr) {
-    // For now: rely on identity mapping
-    // Physical addresses 0-256MB are identity mapped (phys = virt)
-    // This works as long as all allocated memory is within identity mapped region
-    return (void*)phys_addr;
+    // Map physical address to higher-half direct mapping region
+    // Physical 0x00000000 -> Virtual 0xFFFF880000000000
+    // Physical 0x10000000 -> Virtual 0xFFFF880010000000
+    return (void*)(VMM_DIRECT_MAP_BASE + phys_addr);
 }
 
 static inline uintptr_t vmm_virt_to_phys_direct(void* virt_addr) {
-    // For now: rely on identity mapping
-    // This is the inverse of vmm_phys_to_virt for identity-mapped addresses
+    // Convert direct-mapped virtual address back to physical
     uintptr_t virt = (uintptr_t)virt_addr;
 
-    // If address is in kernel space (higher half), it's not identity mapped
-    if (virt >= VMM_KERNEL_BASE) {
-        // Not supported yet - need proper higher-half mapping
-        return 0;
+    // Check if address is in direct mapping region
+    if (virt >= VMM_DIRECT_MAP_BASE && virt < VMM_DIRECT_MAP_BASE + VMM_DIRECT_MAP_SIZE) {
+        return virt - VMM_DIRECT_MAP_BASE;
     }
 
-    // Otherwise assume identity mapping
-    return virt;
+    // If in lower half (identity mapped region 0-256MB), return as-is for compatibility
+    if (virt < 0x10000000) {  // First 256MB
+        return virt;
+    }
+
+    // Otherwise, address is not directly translatable
+    return 0;
 }
 
 // Page fault handling

@@ -22,8 +22,9 @@
 ; 0x34400     - End of kernel
 ; 0x33000     - BSS section (3.9MB uninitialized data)
 ; 0x3F0000    - End of BSS (~4MB mark)
-; 0x500000    - Page tables (16KB: PML4, PDPT, PD, PT) - MOVED ABOVE BSS!
-; 0x510000    - Stack for 32/64-bit modes (grows downward) - MOVED ABOVE BSS!
+; 0x500000    - Page tables (20KB: PML4, 2×PDPT, 2×PD) - MOVED ABOVE BSS!
+; 0x505000    - End of page tables
+; 0x510000    - Stack for 32/64-bit modes (grows downward)
 
 ; === CONSTANTS ===
 KERNEL_LOAD_ADDR      equ 0x10000
@@ -664,32 +665,70 @@ detect_memory_e820:
 ; ===== ФУНКЦИИ 32-BIT РЕЖИМА =====
 
 setup_paging_fixed:
-    ; Очистка области для таблиц страниц (16KB) - now at 0x500000
+    ; ========================================================================
+    ; FIXED PAGE TABLE SETUP WITH PROPER DIRECT MAPPING
+    ; ========================================================================
+    ; Memory layout:
+    ;   PML4:  0x500000 (4KB) - Top level
+    ;   PDPT0: 0x501000 (4KB) - For identity mapping (0-512GB)
+    ;   PDPT1: 0x502000 (4KB) - For direct mapping (0xFFFF880000000000+)
+    ;   PD0:   0x503000 (4KB) - Identity map 0-512MB (256 entries × 2MB)
+    ;   PD1:   0x504000 (4KB) - Direct map 0-512MB  (256 entries × 2MB)
+    ; Total: 20KB (5 pages)
+    ; ========================================================================
+
+    ; Очистка области для таблиц страниц (20KB)
     mov edi, PAGE_TABLE_BASE
-    mov ecx, 4096          ; 16KB / 4 = 4096 dwords
+    mov ecx, 5120          ; 20KB / 4 = 5120 dwords
     xor eax, eax
     rep stosd
 
-    ; PML4 Table (0x500000) - только первая запись (64-bit entry)
-    mov dword [PAGE_TABLE_BASE], PAGE_TABLE_BASE + 0x1000 + 3  ; PDPT at +4KB
+    ; === PML4 Table (0x500000) ===
+    ; Entry 0: Identity mapping (lower half: 0x0000000000000000 - 0x0000007FFFFFFFFF)
+    mov dword [PAGE_TABLE_BASE], PAGE_TABLE_BASE + 0x1000 + 3  ; PDPT0 at +4KB
     mov dword [PAGE_TABLE_BASE + 4], 0x00000000
 
-    ; PDPT (0x501000) - только первая запись (64-bit entry)
-    mov dword [PAGE_TABLE_BASE + 0x1000], PAGE_TABLE_BASE + 0x2000 + 3  ; PD at +8KB
+    ; Entry 272: Direct mapping (0xFFFF880000000000)
+    ; PML4 index for 0xFFFF880000000000 = (0xFFFF880000000000 >> 39) & 0x1FF = 272
+    mov dword [PAGE_TABLE_BASE + 272*8], PAGE_TABLE_BASE + 0x2000 + 3  ; PDPT1 at +8KB
+    mov dword [PAGE_TABLE_BASE + 272*8 + 4], 0x00000000
+
+    ; === PDPT0 (0x501000) - Identity mapping ===
+    ; Entry 0: Points to PD0 (covers 0-1GB)
+    mov dword [PAGE_TABLE_BASE + 0x1000], PAGE_TABLE_BASE + 0x3000 + 3  ; PD0 at +12KB
     mov dword [PAGE_TABLE_BASE + 0x1004], 0x00000000
 
-    ; PD (0x502000) - маппинг первых 32MB как 2MB страницы (для безопасности)
-    mov edi, PAGE_TABLE_BASE
-    add edi, 0x2000       ; PD offset
-    mov eax, 0x000083     ; Present, Writable, Page Size (2MB)
-    mov ecx, 16           ; 16 записей по 2MB = 32MB (was 8 entries = 16MB)
+    ; === PDPT1 (0x502000) - Direct mapping (0xFFFF880000000000+) ===
+    ; Entry 0: Points to PD1 (covers first 1GB of physical RAM)
+    mov dword [PAGE_TABLE_BASE + 0x2000], PAGE_TABLE_BASE + 0x4000 + 3  ; PD1 at +16KB
+    mov dword [PAGE_TABLE_BASE + 0x2004], 0x00000000
 
-.fill_pd:
+    ; === PD0 (0x503000) - Identity mapping: 0-512MB as 2MB pages ===
+    mov edi, PAGE_TABLE_BASE
+    add edi, 0x3000       ; PD0 offset
+    mov eax, 0x000083     ; Present, Writable, Page Size (2MB)
+    mov ecx, 256          ; 256 entries × 2MB = 512MB
+
+.fill_pd0:
     mov [edi], eax        ; Lower 32 bits
-    mov dword [edi+4], 0  ; Upper 32 bits (explicit zero)
-    add eax, 0x200000     ; Следующие 2MB
+    mov dword [edi+4], 0  ; Upper 32 bits
+    add eax, 0x200000     ; Next 2MB
     add edi, 8
-    loop .fill_pd
+    loop .fill_pd0
+
+    ; === PD1 (0x504000) - Direct mapping: 0-512MB as 2MB pages ===
+    ; Maps physical 0-512MB to virtual 0xFFFF880000000000 - 0xFFFF88001FFFFFFF
+    mov edi, PAGE_TABLE_BASE
+    add edi, 0x4000       ; PD1 offset
+    mov eax, 0x000083     ; Present, Writable, Page Size (2MB)
+    mov ecx, 256          ; 256 entries × 2MB = 512MB
+
+.fill_pd1:
+    mov [edi], eax        ; Lower 32 bits
+    mov dword [edi+4], 0  ; Upper 32 bits
+    add eax, 0x200000     ; Next 2MB
+    add edi, 8
+    loop .fill_pd1
 
     ret
 
