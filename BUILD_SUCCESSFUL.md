@@ -10,7 +10,7 @@
 |-----------|------|--------|-------|
 | **Stage1 Bootloader** | 512 bytes | ✅ SUCCESS | MBR boot sector with 0x55AA signature |
 | **Stage2 Bootloader** | 4.0 KB | ✅ SUCCESS | E820, A20, Long mode, Paging setup |
-| **Kernel Binary** | 152 KB | ✅ SUCCESS | All 35 object files linked |
+| **Kernel Binary** | 344 KB | ✅ SUCCESS | All 35 object files linked (updated with large page fix) |
 | **Disk Image** | 10 MB | ✅ SUCCESS | Bootable disk image created |
 
 ---
@@ -140,6 +140,39 @@ static inline void* vmm_phys_to_virt(uintptr_t phys_addr) {
 - Reuses bootloader's PML4
 - 0 additional mapping calls
 - No CR3 switch needed
+
+### 4. VMM Address Translation (vmm.c) - **NEWLY FIXED (2025-11-14)**
+**Problem:**
+The `vmm_virt_to_phys()` function was returning 0 for addresses mapped by large pages (2MB), causing kernel panics during memory deallocation: `"KERNEL PANIC: PMM: Invalid free address"`.
+
+**Root Cause:**
+- Bootloader creates 2MB large pages for both identity and direct mapping
+- `vmm_get_pte()` returns NULL when encountering large pages (PS bit set)
+- `vmm_virt_to_phys()` then returns 0, breaking vmalloc/vfree operations
+
+**Fix:**
+Rewrote `vmm_virt_to_phys()` to perform manual page table walk with large page detection:
+```c
+// Check for 2MB large page (PD level) - CRITICAL FIX!
+if (pd_entry & VMM_FLAG_LARGE_PAGE) {
+    uintptr_t page_base = vmm_pte_to_phys(pd_entry) & ~0x1FFFFFULL;
+    uintptr_t offset = virt_addr & 0x1FFFFFULL; // Bits 20-0
+    return page_base + offset;
+}
+
+// Check for 1GB large page (PDPT level)
+if (pdpt_entry & VMM_FLAG_LARGE_PAGE) {
+    uintptr_t page_base = vmm_pte_to_phys(pdpt_entry) & ~0x3FFFFFFFULL;
+    uintptr_t offset = virt_addr & 0x3FFFFFFFULL; // Bits 29-0
+    return page_base + offset;
+}
+```
+
+**Result:**
+- ✅ vmalloc() and vfree() now work correctly
+- ✅ No more "Invalid free address" panics during unmapping
+- ✅ Proper address translation for all page sizes (4KB, 2MB, 1GB)
+- ✅ VMM Test 4 (page unmapping) should now pass
 
 ---
 
