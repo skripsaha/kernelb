@@ -708,18 +708,65 @@ void vfree(void* addr) {
 
 // ========== ADDRESS TRANSLATION ==========
 uintptr_t vmm_virt_to_phys(vmm_context_t* ctx, uintptr_t virt_addr) {
-    if (!ctx) return 0;
+    if (!ctx || !ctx->pml4) return 0;
 
     spin_lock(&ctx->lock);
 
-    pte_t* pte = vmm_get_pte(ctx, virt_addr); // noalloc
-    if (!pte || !(*pte & VMM_FLAG_PRESENT)) {
+    // Manual page table walk to handle large pages (2MB/1GB)
+    uint32_t pml4_idx = VMM_PML4_INDEX(virt_addr);
+    uint32_t pdpt_idx = VMM_PDPT_INDEX(virt_addr);
+    uint32_t pd_idx   = VMM_PD_INDEX(virt_addr);
+    uint32_t pt_idx   = VMM_PT_INDEX(virt_addr);
+
+    page_table_t* pml4 = ctx->pml4;
+    pte_t pml4_entry = pml4->entries[pml4_idx];
+    if (!(pml4_entry & VMM_FLAG_PRESENT)) {
         spin_unlock(&ctx->lock);
         return 0;
     }
 
-    uintptr_t phys_base = vmm_pte_to_phys(*pte);
-    uintptr_t offset = virt_addr & VMM_PAGE_OFFSET_MASK;
+    page_table_t* pdpt = (page_table_t*)vmm_phys_to_virt(vmm_pte_to_phys(pml4_entry));
+    pte_t pdpt_entry = pdpt->entries[pdpt_idx];
+    if (!(pdpt_entry & VMM_FLAG_PRESENT)) {
+        spin_unlock(&ctx->lock);
+        return 0;
+    }
+
+    // Check for 1GB large page (PDPT level)
+    if (pdpt_entry & VMM_FLAG_LARGE_PAGE) {
+        // 1GB page: bits 29-0 are offset
+        uintptr_t page_base = vmm_pte_to_phys(pdpt_entry) & ~0x3FFFFFFFULL; // Clear low 30 bits
+        uintptr_t offset = virt_addr & 0x3FFFFFFFULL; // Extract bits 29-0
+        spin_unlock(&ctx->lock);
+        return page_base + offset;
+    }
+
+    page_table_t* pd = (page_table_t*)vmm_phys_to_virt(vmm_pte_to_phys(pdpt_entry));
+    pte_t pd_entry = pd->entries[pd_idx];
+    if (!(pd_entry & VMM_FLAG_PRESENT)) {
+        spin_unlock(&ctx->lock);
+        return 0;
+    }
+
+    // Check for 2MB large page (PD level) - THIS IS THE CRITICAL FIX!
+    if (pd_entry & VMM_FLAG_LARGE_PAGE) {
+        // 2MB page: bits 20-0 are offset within the 2MB page
+        uintptr_t page_base = vmm_pte_to_phys(pd_entry) & ~0x1FFFFFULL; // Clear low 21 bits
+        uintptr_t offset = virt_addr & 0x1FFFFFULL; // Extract bits 20-0
+        spin_unlock(&ctx->lock);
+        return page_base + offset;
+    }
+
+    // Regular 4KB page
+    page_table_t* pt = (page_table_t*)vmm_phys_to_virt(vmm_pte_to_phys(pd_entry));
+    pte_t pt_entry = pt->entries[pt_idx];
+    if (!(pt_entry & VMM_FLAG_PRESENT)) {
+        spin_unlock(&ctx->lock);
+        return 0;
+    }
+
+    uintptr_t phys_base = vmm_pte_to_phys(pt_entry);
+    uintptr_t offset = virt_addr & VMM_PAGE_OFFSET_MASK; // 4KB offset (bits 11-0)
 
     spin_unlock(&ctx->lock);
 

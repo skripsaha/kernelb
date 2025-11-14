@@ -1,0 +1,24 @@
+# Build artifacts
+build/
+*.o
+*.bin
+*.img
+*.elf
+*.iso
+
+# Build logs
+build.log
+*.log
+
+# Editor and IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Temporary files
+*.tmp
+*.bak
+*.old
